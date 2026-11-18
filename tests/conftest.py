@@ -51,7 +51,7 @@ async def client(tmp_path, monkeypatch):
 
     pool = await create_pool()
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE wafer_measurements, batches, device_state")
+        await conn.execute("TRUNCATE correction_requests, wafer_measurements, batches, device_state")
         await conn.execute("ALTER SEQUENCE batches_id_seq RESTART WITH 1")
 
     transport = ASGITransport(app=app)

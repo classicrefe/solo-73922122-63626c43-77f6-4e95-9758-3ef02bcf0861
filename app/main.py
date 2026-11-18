@@ -7,12 +7,19 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from .config import settings
+from .corrections import (
+    BatchNotFoundError,
+    CorrectionConflictError,
+    CorrectionValidationError,
+    correct_wafer_numbers,
+)
 from .csvutil import CsvValidationError, parse_thickness_csv
 from .db import close_pool, create_pool
 from .service import (
@@ -72,6 +79,24 @@ async def _conflict_handler(_request, exc: ConflictError):
     )
 
 
+@app.exception_handler(BatchNotFoundError)
+async def _batch_not_found_handler(_request, exc: BatchNotFoundError):
+    return JSONResponse(status_code=404,
+                        content={"error": f"批号不存在 / batch not found: {exc}"})
+
+
+@app.exception_handler(CorrectionValidationError)
+async def _correction_validation_handler(_request,
+                                         exc: CorrectionValidationError):
+    return JSONResponse(status_code=400, content={"error": str(exc)})
+
+
+@app.exception_handler(CorrectionConflictError)
+async def _correction_conflict_handler(_request, exc: CorrectionConflictError):
+    return JSONResponse(status_code=409,
+                        content={"error": str(exc), **exc.details})
+
+
 @app.get("/health")
 async def health():
     from .db import get_pool
@@ -129,6 +154,31 @@ async def query_batch(batch_no: str):
     if detail is None:
         raise HTTPException(404, f"批号不存在 / batch not found: {batch_no}")
     return detail
+
+
+class WaferCorrectionRequest(BaseModel):
+    """Body of the wafer-number correction endpoint."""
+    request_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="幂等请求号；同号同内容重试返回原结果，异内容复用冲突")
+    expected_revision: int = Field(
+        ..., ge=0,
+        description="预期修订号（读取批次详情中的 revision 后填写）")
+    corrections: Dict[str, str] = Field(
+        ..., min_length=1, max_length=1000,
+        description="当前晶圆号 -> 新晶圆号；同批可互换，更正后仍须唯一")
+
+
+@app.post("/batches/{batch_no}/wafer-corrections",
+          summary="更正已放行批的晶圆号（幂等请求号 + 修订号乐观并发）")
+async def correct_wafer_nos(batch_no: str, body: WaferCorrectionRequest):
+    return await correct_wafer_numbers(
+        get_pool_safe(),
+        batch_no=batch_no.strip(),
+        request_id=body.request_id,
+        expected_revision=body.expected_revision,
+        corrections=body.corrections,
+    )
 
 
 @app.get("/devices/{device_id}/batches", summary="按设备列出受理顺序与判定")

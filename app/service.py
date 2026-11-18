@@ -103,8 +103,9 @@ async def _accept_once(pool, *, batch_no, device_id, parsed, artifact) -> Accept
                 artifact.storage_path, next_seq,
             )
             await conn.executemany(
-                "INSERT INTO wafer_measurements(batch_id, wafer_no, thickness_nm) "
-                "VALUES ($1, $2, $3)",
+                "INSERT INTO wafer_measurements"
+                "    (batch_id, wafer_no, original_wafer_no, thickness_nm) "
+                "VALUES ($1, $2, $2, $3)",
                 [(batch_id, w, t) for w, t in parsed.rows],
             )
             await conn.execute(
@@ -169,6 +170,7 @@ async def get_batch_detail(pool: asyncpg.pool.Pool,
             "device_id": row["device_id"],
             "status": row["status"],
             "accept_seq": row["accept_seq"],
+            "revision": row["revision"],
             "wafer_count": await conn.fetchval(
                 "SELECT count(*) FROM wafer_measurements WHERE batch_id=$1",
                 row["id"]),
@@ -231,7 +233,8 @@ async def get_released_data(pool: asyncpg.pool.Pool, *,
         params.append(limit)
         params.append(offset)
         rows = await conn.fetch(
-            f"SELECT id, batch_no, device_id, accept_seq, median_nm, decided_at "
+            f"SELECT id, batch_no, device_id, accept_seq, median_nm, revision, "
+            f"decided_at "
             f"FROM batches{where_sql} ORDER BY id "
             f"LIMIT ${len(params) - 1} OFFSET ${len(params)}",
             *params,
@@ -239,16 +242,20 @@ async def get_released_data(pool: asyncpg.pool.Pool, *,
         out: List[Dict[str, Any]] = []
         for r in rows:
             wafers = await conn.fetch(
-                "SELECT wafer_no, thickness_nm FROM wafer_measurements "
+                "SELECT wafer_no, original_wafer_no, thickness_nm "
+                "FROM wafer_measurements "
                 "WHERE batch_id=$1 ORDER BY wafer_no", r["id"])
             out.append({
                 "batch_no": r["batch_no"],
                 "device_id": r["device_id"],
                 "accept_seq": r["accept_seq"],
                 "median_nm": r["median_nm"],
+                "revision": r["revision"],
                 "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
                 "wafers": [
-                    {"wafer_no": w["wafer_no"], "thickness_nm": w["thickness_nm"]}
+                    {"wafer_no": w["wafer_no"],
+                     "original_wafer_no": w["original_wafer_no"],
+                     "thickness_nm": w["thickness_nm"]}
                     for w in wafers
                 ],
             })

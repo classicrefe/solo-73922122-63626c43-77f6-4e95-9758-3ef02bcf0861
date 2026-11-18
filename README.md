@@ -28,23 +28,52 @@
 | 不重复推进参考、无半批 | 事务内 `SELECT ... FOR UPDATE` 锁 `device_state` 与批次行，决策字段与 `ref_batch_ids` 同事务提交；FIFO 序号断言 `accept_seq = last_decided_seq + 1` |
 | 供数只给放行明细 | `/data/released` SQL 固定 `status='RELEASED'`，隔离批任何过滤条件都查不到 |
 
+## 晶圆号更正（已放行批）
+
+数据员发现已放行批的晶圆号录错时，可整批更正下游取得的编号，厚度不变：
+
+```
+POST /batches/{batch_no}/wafer-corrections
+{
+  "request_id": "REQ-2026-0001",        // 幂等请求号
+  "expected_revision": 0,               // 预期修订号（先读批次详情获取）
+  "corrections": {"W001": "W101", "W002": "W001", "W101": "W002"}
+}
+```
+
+* **仅已放行批**可更正；PENDING/QUARANTINED → `409`；
+* **修订号乐观并发**：批次详情 `GET /batches/{batch_no}` 返回当前 `revision`；
+  更正请求携带 `expected_revision`，不一致 → `409`（响应含 `current_revision`）。
+  两个实例用同一修订号提交不同请求时，行锁 + 修订号检查保证只有一项生效；
+* **幂等重试**：`request_id` 与请求内容哈希记入 `correction_requests` 台账。
+  响应丢失后用同一请求号重试 → 返回原结果（`replayed=true`，不重复应用）；
+  同一请求号提交不同内容 → `409`；
+* **原子生效**：编号改写、`revision` 递增与台账行在同一事务提交，
+  失败不留部分更正；同批编号允许互换（主键唯一性延迟到提交时检查），
+  更正后批内编号仍须唯一，否则整体 `400`；
+* **供数双编号**：`/data/released` 每片同时返回 `wafer_no`（更正后当前编号）
+  与 `original_wafer_no`（原始 CSV 编号），并带批次 `revision`；
+* 原始 CSV、`sha256`、放行结论、参考历史与厚度均不受更正影响，上传与判定照常。
+  更正只改当前编号，后续更正须以上一次的当前编号为键（可链式）。
+
 ## 目录结构
 
 ```
 app/
   config.py     环境变量配置与判定常量（前3批/参考3批/阈值5nm）
-  schema.py     PostgreSQL 表结构
+  schema.py     PostgreSQL 表结构（含修订号/原始编号/更正台账）与幂等迁移
   db.py         asyncpg 连接池 + jsonb codec
   csvutil.py    严格 CSV 解析（1~1000片、片号批内唯一、厚度正整数）
   storage.py    原件内容寻址持久化（tmp+fsync+原子rename）
   service.py    受理（幂等/冲突）、查询、供数读模型
+  corrections.py 晶圆号更正（幂等请求号 + 修订号乐观并发 + 单事务原子）
   worker.py     后台判定 worker（设备咨询锁 + 单事务原子判定）
   main.py       FastAPI 路由、生命周期（每实例启动一个 worker）
 scripts/
   worker_harness.py  单实例 worker 驱动（提交/慢批/崩溃标记/空闲退出）
   demo_local.py      本地双实例端到端演示（便携 Postgres）
   demo_compose.sh    Docker Compose 栈演示
-tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（23 个）
+tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复、晶圆号更正
 deploy/nginx/   双实例轮询负载均衡
 docker-compose.yml  db + api1 + api2 + nginx
 ```
@@ -78,9 +107,10 @@ python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
 | 方法/路径 | 说明 |
 | --- | --- |
 | `POST /batches` | multipart：`batch_no`、`device_id`、`file`(CSV)；成功 `202`，校验失败 `400`，冲突 `409` |
-| `GET /batches/{batch_no}` | 判定结果、中位数、偏差、参考批号、原件路径、尝试次数、决定实例 |
+| `GET /batches/{batch_no}` | 判定结果、中位数、偏差、参考批号、当前修订号 `revision`、原件路径、尝试次数、决定实例 |
+| `POST /batches/{batch_no}/wafer-corrections` | 更正已放行批晶圆号：`request_id` + `expected_revision` + 编号映射；`200`/`400`/`404`/`409` |
 | `GET /devices/{device_id}/batches` | 按设备列受理顺序与状态 |
-| `GET /data/released` | 供数接口，**仅放行**批的晶圆明细，支持 device/batch 过滤与分页 |
+| `GET /data/released` | 供数接口，**仅放行**批的晶圆明细（含当前编号与原始编号、批次修订号），支持 device/batch 过滤与分页 |
 | `GET /health` | 存活与数据库连通性 |
 | `POST /internal/shutdown?token=` | 仅演示用；未设 `SHUTDOWN_TOKEN` 时返回 404，不出现在 OpenAPI |
 
@@ -99,10 +129,12 @@ W002,508
 ```bash
 DATABASE_DSN=<postgres dsn> python -m pytest -q
 ```
-28 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
+43 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
 隔离批不进参考窗、滚动窗口滑动、幂等重试与 409 冲突、供数不可见隔离批、
 双 worker 同设备 FIFO 与跨设备并行、小连接池下高并发同设备受理无死锁（回归）、
-真实子进程硬退出后的接续与无半批。
+真实子进程硬退出后的接续与无半批、晶圆号更正（放行前/隔离批拒绝、互换、
+唯一性与链式更正、修订号乐观并发唯一生效、同请求号重试重放、异内容复用冲突、
+失败无部分更正、更正不影响判定与参考历史）。
 
 ## 演示中的慢批/崩溃钩子（仅测试用途）
 
